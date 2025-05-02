@@ -17,7 +17,22 @@ from claspy.nearest_neighbour import _sliding_dot
 import hnswlib
 import gc
 from concurrent.futures import ThreadPoolExecutor
+import time
+from functools import lru_cache
 
+# Cache for FJLT matrices
+_fjlt_matrix_cache = {}
+
+def _get_fjlt_matrix(target_dim, total_dim):
+    cache_key = (target_dim, total_dim)
+    if cache_key not in _fjlt_matrix_cache:
+        # Generate FJLT matrix
+        R = np.random.choice([-1, 1], size=(target_dim, total_dim))
+        H = np.fft.fft(R, axis=1) / np.sqrt(total_dim)
+        _fjlt_matrix_cache[cache_key] = H
+    return _fjlt_matrix_cache[cache_key]
+
+## HNSW KNN Implementation
 def _knn_hnsw(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
          distance, distance_preprocessing, batch_size=100, num_threads=4):
     l = len(time_series) - window_size + 1
@@ -107,16 +122,13 @@ def _knn_hnsw(time_series, start, end, window_size, k_neighbours, tcs, dot_first
 
     return dists, knns
 
+## FJLT KNN Implementation
 def _knn_fjlt(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
               distance, distance_preprocessing, target_dim=32, batch_size=100):
+    s = time.time()
     l = len(time_series) - window_size + 1
-    exclusion_radius = np.int64(window_size / 2)
     dims = time_series.shape[1]
     total_dim = window_size * dims
-
-    # Initialize output arrays
-    knns = np.full((end - start, len(tcs) * k_neighbours), -1, dtype=np.int64)
-    dists = np.full((end - start, len(tcs) * k_neighbours), np.inf, dtype=np.float32)
 
     # 1. Preprocess subsequences
     def preprocess_subsequence(ss):
@@ -129,48 +141,32 @@ def _knn_fjlt(time_series, start, end, window_size, k_neighbours, tcs, dot_first
         ss = time_series[i:i + window_size].reshape(-1)
         subsequences[i] = preprocess_subsequence(ss)
 
-    # 2. Generate FJLT matrix
-    R = np.random.choice([-1, 1], size=(target_dim, total_dim))
-    H = np.fft.fft(R, axis=1) / np.sqrt(total_dim)
+    # 2. Get FJLT matrix from cache or compute new one
+    H = _get_fjlt_matrix(target_dim, total_dim)
     
     # 3. Apply FJLT to reduce dimensionality
     reduced_subsequences = np.dot(subsequences, H.T)
 
-    # 4. Process in batches
-    for tc_idx, (lbound, ubound) in enumerate(tcs):
-        for batch_start in range(start, end, batch_size):
-            batch_end = min(batch_start + batch_size, end)
-            if batch_start >= ubound or batch_end <= lbound:
-                continue
+    # 4. Use ClaSPy's KNN implementation on reduced data
+    from claspy.nearest_neighbour import KSubsequenceNeighbours
+    
+    # Create a KNN instance with the reduced dimensionality
+    knn = KSubsequenceNeighbours(
+        window_size=1,  # Since we've already windowed the data
+        k_neighbours=k_neighbours,
+        distance="znormed_euclidean_distance",  # Use string identifier instead of function
+        n_jobs=1
+    )
+    
+    # Let ClaSPy handle the KNN search
+    knn.fit(reduced_subsequences)
+    distances, indices = knn.kneighbors(reduced_subsequences[start:end], return_distance=True)
+    
+    e = time.time()
+    print(f"FJLT KNN took {e - s} seconds")
+    return distances, indices
 
-            batch_queries = reduced_subsequences[batch_start:batch_end]
-            tc_subsequences = reduced_subsequences[lbound:ubound - window_size + 1]
-            
-            for i, query in enumerate(batch_queries):
-                order = batch_start + i
-                if order < lbound or order >= ubound:
-                    continue
-
-                # Get valid indices
-                valid_indices = np.arange(lbound, ubound - window_size + 1)
-                mask = ~((valid_indices >= order - exclusion_radius) & 
-                        (valid_indices < order + exclusion_radius))
-                valid_indices = valid_indices[mask]
-                
-                if len(valid_indices) >= k_neighbours:
-                    # Compute distances
-                    distances = np.linalg.norm(query - tc_subsequences[valid_indices - lbound], axis=1)
-                    
-                    # Get k nearest neighbors
-                    idx = np.argsort(distances)[:k_neighbours]
-                    nn_indices = valid_indices[idx]
-                    nn_distances = distances[idx]
-
-                    knns[order - start, tc_idx * k_neighbours:(tc_idx + 1) * k_neighbours] = nn_indices
-                    dists[order - start, tc_idx * k_neighbours:(tc_idx + 1) * k_neighbours] = nn_distances
-
-    return dists, knns
-
+## Abstract Base Class for KNN Models, Code straight from claspy package
 class BaseKNN(KSubsequenceNeighbours):
     def __init__(self, window_size=10, k_neighbours=10, distance="euclidean",
                  n_jobs=1, **kwargs):
@@ -276,6 +272,7 @@ class FJLTKNN(BaseKNN):
         return _knn_fjlt(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
                         distance, distance_preprocessing, target_dim, batch_size)
 
+## Wrapper for HNSW and FJLT KNN Models
 class AltKNN(BaseKNN):
     def __init__(self, window_size=10, k_neighbours=10, distance="euclidean",
                  n_jobs=1, method="hnsw", **kwargs):
@@ -288,12 +285,16 @@ class AltKNN(BaseKNN):
     def _knn_impl(self, *args, **kwargs):
         return self.impl._knn_impl(*args, **kwargs)
 
+
+## Overrided ClaSPEnsemble Method, not super important, code from claspy packag 
 class AltClaSPEnsemble(ClaSPEnsemble):
     def __init__(self, method, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        print('AltClaSPEnsemble Init')
         self.method = method
 
     def fit(self, time_series, knn=None, validation="significance_test", threshold=1e-15):
+        print('AltClaSPEnsemble Fit')
         time_series = check_input_time_series(time_series)
         self.min_seg_size = self.window_size * self.excl_radius
 
@@ -348,12 +349,15 @@ class AltClaSPEnsemble(ClaSPEnsemble):
         self.is_fitted = True
         return self
 
+## Overrided ClaSP Method, not super important
 class AltBinaryClaSPSegmentation(BinaryClaSPSegmentation):
     def __init__(self, method, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        print('AltBinaryClaSPSegmentation Init')
         self.method = method
 
     def fit(self, time_series):
+        print('AltBinaryClaSPSegmentation Fit')
         time_series = check_input_time_series(time_series)
 
         if isinstance(self.window_size, str):
@@ -502,9 +506,11 @@ def run_analysis(tssb, method):
     return results
 
 if __name__ == "__main__":
-    datasets = ["InlineSkate", "Plane", "ArrowHead"]
+    print('started')
+    datasets = ['ArrowHead', "Crop", "Plane", "Fish"]
     tssb = load_time_series_segmentation_datasets(names=datasets)
-    classifiers = [BinaryClaSPSegmentation(), AltBinaryClaSPSegmentation(method="fjlt")]
+    classifiers = [AltBinaryClaSPSegmentation(method="fjlt"), AltBinaryClaSPSegmentation(method="hnsw")]
     results = [pd.DataFrame(run_analysis(tssb, x)) for x in classifiers]
     a = pd.concat(results)
     print(a.sort_values(by=['Time Series', 'Algo'], ascending=False))
+    #sample change
