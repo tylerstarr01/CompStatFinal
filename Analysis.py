@@ -17,22 +17,10 @@ from claspy.nearest_neighbour import _sliding_dot
 import hnswlib
 import gc
 from concurrent.futures import ThreadPoolExecutor
-import time
-from functools import lru_cache
+import hashlib
+import pickle
+from sklearn.neighbors import KDTree
 
-# Cache for FJLT matrices
-_fjlt_matrix_cache = {}
-
-def _get_fjlt_matrix(target_dim, total_dim):
-    cache_key = (target_dim, total_dim)
-    if cache_key not in _fjlt_matrix_cache:
-        # Generate FJLT matrix
-        R = np.random.choice([-1, 1], size=(target_dim, total_dim))
-        H = np.fft.fft(R, axis=1) / np.sqrt(total_dim)
-        _fjlt_matrix_cache[cache_key] = H
-    return _fjlt_matrix_cache[cache_key]
-
-## HNSW KNN Implementation
 def _knn_hnsw(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
          distance, distance_preprocessing, batch_size=100, num_threads=4):
     l = len(time_series) - window_size + 1
@@ -122,13 +110,48 @@ def _knn_hnsw(time_series, start, end, window_size, k_neighbours, tcs, dot_first
 
     return dists, knns
 
-## FJLT KNN Implementation
+def _get_fjlt_matrix(total_dim, target_dim):
+    """Get or create FJLT matrix with caching"""
+    # Create a unique hash for the matrix parameters
+    matrix_hash = hashlib.md5(f"{total_dim}_{target_dim}".encode()).hexdigest()
+    cache_dir = "fjlt_cache"
+    cache_file = os.path.join(cache_dir, f"fjlt_matrix_{matrix_hash}.pkl")
+    
+    # Create cache directory if it doesn't exist
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    
+    # Try to load from cache
+    if os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+    
+    # Generate new matrix if not in cache
+    R = np.random.choice([-1, 1], size=(target_dim, total_dim))
+    H = np.abs(np.fft.fft(R, axis=1)) / np.sqrt(total_dim)
+    
+    # Save to cache
+    with open(cache_file, 'wb') as f:
+        pickle.dump(H, f)
+    
+    return H
+
 def _knn_fjlt(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
-              distance, distance_preprocessing, target_dim=32, batch_size=100):
-    s = time.time()
+              distance, distance_preprocessing, target_dim=4, batch_size=100):
     l = len(time_series) - window_size + 1
+    exclusion_radius = np.int64(window_size / 2)
     dims = time_series.shape[1]
     total_dim = window_size * dims
+    target_dim = int(min(total_dim, 4*np.log(total_dim)))
+    
+    # Debug print to understand dimensions
+    # print(f"Debug - Time series shape: {time_series.shape}")
+    # print(f"Debug - Window size: {window_size}, Dimensions: {dims}")
+    # print(f"Debug - Total dim: {total_dim}, Target dim: {target_dim}")
+
+    # Initialize output arrays
+    knns = np.full((end - start, len(tcs) * k_neighbours), -1, dtype=np.int64)
+    dists = np.full((end - start, len(tcs) * k_neighbours), np.inf, dtype=np.float32)
 
     # 1. Preprocess subsequences
     def preprocess_subsequence(ss):
@@ -141,32 +164,105 @@ def _knn_fjlt(time_series, start, end, window_size, k_neighbours, tcs, dot_first
         ss = time_series[i:i + window_size].reshape(-1)
         subsequences[i] = preprocess_subsequence(ss)
 
-    # 2. Get FJLT matrix from cache or compute new one
-    H = _get_fjlt_matrix(target_dim, total_dim)
+    # 2. Get FJLT matrix from cache or generate new one
+    H = _get_fjlt_matrix(total_dim, target_dim)
     
     # 3. Apply FJLT to reduce dimensionality
     reduced_subsequences = np.dot(subsequences, H.T)
+    
+    # Print dimensionality reduction information
+    print(f"FJLT Dimensionality Reduction: {total_dim} -> {target_dim} ({(target_dim/total_dim)*100:.2f}% of original dimension)")
 
-    # 4. Use ClaSPy's KNN implementation on reduced data
-    from claspy.nearest_neighbour import KSubsequenceNeighbours
-    
-    # Create a KNN instance with the reduced dimensionality
-    knn = KSubsequenceNeighbours(
-        window_size=1,  # Since we've already windowed the data
-        k_neighbours=k_neighbours,
-        distance="znormed_euclidean_distance",  # Use string identifier instead of function
-        n_jobs=1
-    )
-    
-    # Let ClaSPy handle the KNN search
-    knn.fit(reduced_subsequences)
-    distances, indices = knn.kneighbors(reduced_subsequences[start:end], return_distance=True)
-    
-    e = time.time()
-    print(f"FJLT KNN took {e - s} seconds")
-    return distances, indices
+    # 4. Process in batches
+    for tc_idx, (lbound, ubound) in enumerate(tcs):
+        for batch_start in range(start, end, batch_size):
+            batch_end = min(batch_start + batch_size, end)
+            if batch_start >= ubound or batch_end <= lbound:
+                continue
 
-## Abstract Base Class for KNN Models, Code straight from claspy package
+            batch_queries = reduced_subsequences[batch_start:batch_end]
+            tc_subsequences = reduced_subsequences[lbound:ubound - window_size + 1]
+            
+            for i, query in enumerate(batch_queries):
+                order = batch_start + i
+                if order < lbound or order >= ubound:
+                    continue
+
+                # Get valid indices
+                valid_indices = np.arange(lbound, ubound - window_size + 1)
+                mask = ~((valid_indices >= order - exclusion_radius) & 
+                        (valid_indices < order + exclusion_radius))
+                valid_indices = valid_indices[mask]
+                
+                if len(valid_indices) >= k_neighbours:
+                    # Compute distances
+                    distances = np.linalg.norm(query - tc_subsequences[valid_indices - lbound], axis=1)
+                    
+                    # Get k nearest neighbors
+                    idx = np.argsort(distances)[:k_neighbours]
+                    nn_indices = valid_indices[idx]
+                    nn_distances = distances[idx]
+
+                    knns[order - start, tc_idx * k_neighbours:(tc_idx + 1) * k_neighbours] = nn_indices
+                    dists[order - start, tc_idx * k_neighbours:(tc_idx + 1) * k_neighbours] = nn_distances
+
+    return dists, knns
+
+def _knn_fjlt_kdtree(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
+                     distance, distance_preprocessing, target_dim=4, batch_size=100):
+    """
+    Alternate FJLT+KNN implementation using a k-d tree for neighbor search after projection.
+    """
+    l = len(time_series) - window_size + 1
+    exclusion_radius = np.int64(window_size / 2)
+    dims = time_series.shape[1]
+    total_dim = window_size * dims
+    target_dim = int(min(total_dim, 4 * np.log(total_dim)))
+
+    # Preprocess subsequences
+    def preprocess_subsequence(ss):
+        mean = np.mean(ss)
+        std = np.std(ss) + 1e-8
+        return (ss - mean) / std
+
+    subsequences = np.zeros((l, total_dim), dtype=np.float32)
+    for i in range(l):
+        ss = time_series[i:i + window_size].reshape(-1)
+        subsequences[i] = preprocess_subsequence(ss)
+
+    # FJLT projection
+    H = _get_fjlt_matrix(total_dim, target_dim)
+    reduced_subsequences = np.dot(subsequences, H.T)
+    print(f"FJLT Dimensionality Reduction (KDTree): {total_dim} -> {target_dim} ({(target_dim/total_dim)*100:.2f}% of original dimension)")
+
+    # Output arrays
+    knns = np.full((end - start, len(tcs) * k_neighbours), -1, dtype=np.int64)
+    dists = np.full((end - start, len(tcs) * k_neighbours), np.inf, dtype=np.float32)
+
+    # For each temporal constraint, build a KDTree and query
+    for tc_idx, (lbound, ubound) in enumerate(tcs):
+        tc_indices = np.arange(lbound, ubound - window_size + 1)
+        if len(tc_indices) == 0:
+            continue
+        tc_subsequences = reduced_subsequences[tc_indices]
+        kdtree = KDTree(tc_subsequences)
+
+        for order in range(start, end):
+            if order < lbound or order >= ubound:
+                continue
+            query = reduced_subsequences[order].reshape(1, -1)
+            # Exclude indices within exclusion radius
+            valid_indices = tc_indices[(tc_indices < order - exclusion_radius) | (tc_indices >= order + exclusion_radius)]
+            if len(valid_indices) < k_neighbours:
+                continue
+            valid_subseqs = reduced_subsequences[valid_indices]
+            valid_tree = KDTree(valid_subseqs)
+            dist, ind = valid_tree.query(query, k=k_neighbours)
+            knns[order - start, tc_idx * k_neighbours:(tc_idx + 1) * k_neighbours] = valid_indices[ind[0]]
+            dists[order - start, tc_idx * k_neighbours:(tc_idx + 1) * k_neighbours] = dist[0]
+
+    return dists, knns
+
 class BaseKNN(KSubsequenceNeighbours):
     def __init__(self, window_size=10, k_neighbours=10, distance="euclidean",
                  n_jobs=1, **kwargs):
@@ -269,10 +365,9 @@ class HNSWKNN(BaseKNN):
 class FJLTKNN(BaseKNN):
     def _knn_impl(self, time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
                   distance, distance_preprocessing, target_dim=32, batch_size=100):
-        return _knn_fjlt(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
+        return _knn_fjlt_kdtree(time_series, start, end, window_size, k_neighbours, tcs, dot_first, dot_ref,
                         distance, distance_preprocessing, target_dim, batch_size)
 
-## Wrapper for HNSW and FJLT KNN Models
 class AltKNN(BaseKNN):
     def __init__(self, window_size=10, k_neighbours=10, distance="euclidean",
                  n_jobs=1, method="hnsw", **kwargs):
@@ -285,16 +380,12 @@ class AltKNN(BaseKNN):
     def _knn_impl(self, *args, **kwargs):
         return self.impl._knn_impl(*args, **kwargs)
 
-
-## Overrided ClaSPEnsemble Method, not super important, code from claspy packag 
 class AltClaSPEnsemble(ClaSPEnsemble):
     def __init__(self, method, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print('AltClaSPEnsemble Init')
         self.method = method
 
     def fit(self, time_series, knn=None, validation="significance_test", threshold=1e-15):
-        print('AltClaSPEnsemble Fit')
         time_series = check_input_time_series(time_series)
         self.min_seg_size = self.window_size * self.excl_radius
 
@@ -349,24 +440,29 @@ class AltClaSPEnsemble(ClaSPEnsemble):
         self.is_fitted = True
         return self
 
-## Overrided ClaSP Method, not super important
 class AltBinaryClaSPSegmentation(BinaryClaSPSegmentation):
     def __init__(self, method, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print('AltBinaryClaSPSegmentation Init')
         self.method = method
+        # self.window_size = 'fft'
 
     def fit(self, time_series):
-        print('AltBinaryClaSPSegmentation Fit')
         time_series = check_input_time_series(time_series)
 
         if isinstance(self.window_size, str):
             window_sizes = []
-
+            print(f"\nCalculating window size for dataset with shape: {time_series.shape}")
+            
             for dim in range(time_series.shape[1]):
-                window_sizes.append(max(3, map_window_size_methods(self.window_size)(time_series[:, dim]) // 2))
+                raw_window_size = map_window_size_methods(self.window_size)(time_series[:, dim])
+                # print(self.window_size)
+                adjusted_window_size = max(3, raw_window_size // 2)
+                window_sizes.append(adjusted_window_size)
+                # print(f"Dimension {dim}: Raw window size = {raw_window_size}, Adjusted = {adjusted_window_size}")
 
-            self.window_size = int(np.min(window_sizes)) if len(window_sizes) > 0 else 10
+            # Use mean window size instead of min to better capture dataset characteristics
+            self.window_size = int(np.mean(window_sizes)) if len(window_sizes) > 0 else 10
+            print(f"Final window size: {self.window_size}\n")
 
         self.min_seg_size = self.window_size * self.excl_radius
 
@@ -500,17 +596,196 @@ def run_analysis(tssb, method):
             'Algo': m,
             'Time Series': ts_name,
             'Found Change Points': found_cps.tolist(),
+            'True Change Points': cps,
             'Score': score,
             'Run Time': (end_time - start_time)
         })
     return results
 
+def generate_synthetic_multivariate_ts(N=10000, k=5, dims=100, seed=42):
+    """
+    Generate a synthetic multivariate time series with k change points.
+    Between change points, data is generated using different stochastic processes.
+    
+    Parameters:
+    -----------
+    N : int
+        Length of the time series
+    k : int
+        Number of change points
+    dims : int
+        Number of dimensions (features) in the time series
+    seed : int, optional
+        Random seed for reproducibility
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing the time series data in TSSB format
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # Generate k+1 segments with random lengths
+    rv = np.random.rand(k+1)
+    rvs = rv.sum()
+    segment_lengths = np.random.multinomial(N - k - 1, rv/rvs) + 1
+    # segment_lengths = np.random.uniform(N/k, size=k).astype(int)
+    segment_lengths = np.array([100, 50, 400, 150])
+    change_points = np.cumsum(segment_lengths[:-1])
+    # change_points = (np.array([990, 3430, 4250])/10).astype(int)
+    # segment_lengths = (np.array([990, 3430-990, 4250-3430, N-4250])/10).astype(int)
+    # Initialize time series array
+    ts = np.zeros((N, dims))
+    
+    # Define different stochastic processes
+    def ar_process(length, dims, params):
+        """Generate AR(1) process"""
+        noise = np.random.normal(0, 1, (length, dims))
+        data = np.zeros((length, dims))
+        data[0] = noise[0]
+        for i in range(1, length):
+            data[i] = params['phi'] * data[i-1] + noise[i]
+        return data
+    
+    def ma_process(length, dims, params):
+        """Generate MA(1) process"""
+        noise = np.random.normal(0, 1, (length+1, dims))
+        data = np.zeros((length, dims))
+        for i in range(length):
+            data[i] = noise[i] + params['theta'] * noise[i+1]
+        return data
+    
+    def random_walk(length, dims, params):
+        """Generate random walk process"""
+        steps = np.random.normal(0, params['sigma'], (length, dims))
+        return np.cumsum(steps, axis=0)
+    
+    def wiener_process(length, dims, params):
+        """Generate Wiener process (standard Brownian motion)"""
+        dt = 0.5  # time step
+        noise = np.random.normal(0, 1, (length, dims))
+        data = np.zeros((length, dims))
+        data[0] = params.get('initial_value', 0.0)  # default initial value is 0.0
+        
+        # Wiener process: W_t = W_0 + σ√t * Z, where Z ~ N(0,1)
+        for i in range(1, length):
+            data[i] = data[i-1] + params['sigma'] * np.sqrt(dt) * noise[i]
+        
+        return data
+    
+    # List of possible processes with their parameters
+    processes = [
+        (ar_process, {'phi': 0.8}),
+        (ar_process, {'phi': -0.8})
+        # (ma_process, {'theta': 0.8}),
+        # (random_walk, {'sigma': 0.75}),
+        # (random_walk, {'sigma': 0.1}),
+        # (wiener_process, {'sigma': 0.3, 'initial_value': 0.0}),
+        # (wiener_process, {'sigma': 0.6, 'initial_value': 0.0}),
+        # (wiener_process, {'sigma': 0.1, 'initial_value': 0.0})  # Standard Brownian motion
+        # (wiener_process, {'sigma': 0.6, 'initial_value': 0.0})   # Higher volatility Brownian motion
+    ]
+    
+
+    indices_chosen = []
+    # Generate each segment
+    start_idx = 0
+    np.random.seed(seed)
+    my_processes = [0, 1, 1, 0]
+    for i, length in enumerate(segment_lengths):
+        # Randomly select a process for this segment
+        idx_chosen = np.random.randint(len(processes))
+        # print(idx_chosen)
+        idx_chosen = my_processes[i]
+        # print(idx_chosen)
+        process_func, params = processes[idx_chosen]
+        indices_chosen.append(idx_chosen)
+        
+        # Generate the segment
+        # segment = process_func(length, dims, params)
+        # segment = wiener_process(length, dims, {'sigma': 0.3, 'initial_value': 0.0})
+        segment = process_func(length, dims, params)
+        
+        # Add some random scaling and shifting to make segments more distinct
+        # scale = np.random.uniform(0.5, 2.0, dims)
+        # shift = np.random.uniform(-5, 5, dims)
+        # segment = segment * scale + shift
+        
+        # Add the segment to the time series
+        ts[start_idx:start_idx+length] = segment
+        start_idx += length
+    
+    # Create output in TSSB format
+    print(indices_chosen)
+    true_change_points = []
+    last = -1
+    incl_zero = [0] + change_points.tolist()
+    for i, cp in zip(indices_chosen, incl_zero):
+        if i != last:
+            if cp != 0:
+                true_change_points.append(cp)
+            last = i
+    # print(change_points)
+    # print(indices_chosen)
+    print(true_change_points)
+
+    return {
+        'dataset': f'Synthetic_{dims}',
+        'window_size': 100,  # Default window size
+        'change_points': true_change_points,
+        'time_series': ts
+    }
+
+import matplotlib.pyplot as plt
+
 if __name__ == "__main__":
-    print('started')
-    datasets = ['ArrowHead', "Crop", "Plane", "Fish"]
+    # Generate synthetic data
+    synthetic_data = [generate_synthetic_multivariate_ts(N=700, k=3, dims=x, seed=42) for x in [1]]
+    
+    # Create DataFrame for synthetic data
+    synthetic_df = pd.DataFrame(synthetic_data)
+    plt.plot(synthetic_df.time_series.values[0], linewidth=0.5)
+    plt.title(f'Time Series Example with Change Points')
+    # Add vertical lines at true change points
+    for cp in synthetic_df.change_points.values[0]:
+        plt.axvline(cp, color='red', linestyle='--', linewidth=1)
+    plt.show()
+    
+    # Load univariate datasets
+    datasets = ["ArrowHead"]
     tssb = load_time_series_segmentation_datasets(names=datasets)
-    classifiers = [AltBinaryClaSPSegmentation(method="fjlt"), AltBinaryClaSPSegmentation(method="hnsw")]
-    results = [pd.DataFrame(run_analysis(tssb, x)) for x in classifiers]
+    
+    # # Load multivariate datasets
+    # multi_datasets = ['BeetleFly', 'BirdChicken']
+    # multi_data = load_time_series_segmentation_datasets(names=multi_datasets)
+    print(synthetic_df)
+    
+    # Create a single entry with combined multivariate time series
+    # multi_ts = np.stack(multi_data['time_series'].values)
+    
+    # Create a new DataFrame for multivariate analysis
+    # multi_df = pd.DataFrame({
+    #     'dataset': ['Multi'],
+    #     'window_size': [10],
+    #     'change_points': [[1280]],
+    #     'time_series': [multi_ts.T]
+    # })
+    
+    # Combine all datasets
+    combined_tssb = pd.concat([tssb, synthetic_df])
+    # combined_tssb = synthetic_df
+    # print(combined_tssb)
+    
+    # Run analysis on all datasets
+    classifiers = [
+        BinaryClaSPSegmentation(window_size='fft'),
+        AltBinaryClaSPSegmentation(method="fjlt"),
+        # AltBinaryClaSPSegmentation(method="hnsw")
+    ]
+    results = [pd.DataFrame(run_analysis(combined_tssb, x)) for x in classifiers]
     a = pd.concat(results)
     print(a.sort_values(by=['Time Series', 'Algo'], ascending=False))
-    #sample change
+    a.sort_values(by=['Time Series', 'Algo'], ascending=False).to_csv('simulated_kdtree.csv', index=False)
+    print(combined_tssb.change_points)
+
